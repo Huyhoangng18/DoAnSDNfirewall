@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SDN Control — Rules/TI/IDS</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" />
+  <style>
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    code.small { font-size: .85rem; }
+    .table-fixed { table-layout: fixed; }
+    .truncate { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  </style>
+</head>
+<body class="bg-light">
+<div class="container py-4">
+  <h1 class="mb-4">SDN Controller — Rules@0 · TI@1 · IDS (rules + alerts)</h1>
+
+  <ul class="nav nav-tabs mb-3">
+    <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#rules-pane">Rules</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#ti-pane">Threat Intel</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#ids-pane">IDS</button></li>
+  </ul>
+
+  <div class="tab-content">
+
+    <!-- RULES -->
+    <div class="tab-pane fade show active" id="rules-pane">
+      <div class="card mb-3">
+        <div class="card-header">Thêm / Cập nhật Rule (table 0)</div>
+        <div class="card-body">
+          <form id="ruleForm" class="row g-3">
+            <div class="col-md-3"><label class="form-label">Rule ID</label><input id="rule_id" class="form-control" placeholder="drop_tcp80_10-0-1-10_to_10-0-1-11"/></div>
+            <div class="col-md-2"><label class="form-label">Priority</label><input id="priority" type="number" class="form-control" value="1800"/></div>
+            <div class="col-md-2"><label class="form-label">Action</label><select id="action" class="form-select"><option>drop</option><option>allow</option></select></div>
+            <div class="col-md-2"><label class="form-label">TCP Dst</label><input id="tcp_dst" type="number" class="form-control" placeholder="80"/></div>
+            <div class="col-md-3"><label class="form-label">Scope</label><select id="scope" class="form-select"><option value="l3" selected>l3 (sL3)</option><option value="all">all</option></select></div>
+            <div class="col-md-6"><label class="form-label">IPv4 Src</label><input id="ipv4_src" class="form-control" placeholder="10.0.1.10"/></div>
+            <div class="col-md-6"><label class="form-label">IPv4 Dst</label><input id="ipv4_dst" class="form-control" placeholder="10.0.1.11"/></div>
+            <div class="col-12">
+              <button class="btn btn-primary" type="submit">Upsert</button>
+              <button class="btn btn-outline-secondary ms-2" type="button" id="fillSample">Ví dụ</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span>Danh sách Rule</span><button class="btn btn-sm btn-outline-primary" id="refreshRules">Tải lại</button>
+        </div>
+        <div class="card-body p-0">
+          <table class="table table-striped table-hover mb-0" id="rulesTable">
+            <thead class="table-light"><tr><th>Rule ID</th><th>Priority</th><th>Action</th><th>Match</th><th>Scope</th><th style="width:120px">Thao tác</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- TI -->
+    <div class="tab-pane fade" id="ti-pane">
+      <div class="card mb-3">
+        <div class="card-header">Thêm IP/CIDR vào TI (DROP @ table 1)</div>
+        <div class="card-body">
+          <form id="tiForm" class="row g-3">
+            <div class="col-md-9"><label class="form-label">IP hoặc CIDR</label><input id="ti_input" class="form-control" placeholder="8.8.8.8 hoặc 203.0.113.0/24"/></div>
+            <div class="col-md-3 d-flex align-items-end"><button class="btn btn-danger w-100" type="submit">Thêm TI</button></div>
+          </form>
+          <div class="small text-muted mt-2">Auto-update mỗi 5 phút. Data: <code class="mono">/tmp/ti_blacklist.jsonl</code>.</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span>Danh sách TI (500 mục/trang)</span>
+          <div>
+            <button class="btn btn-sm btn-outline-secondary" id="tiPrev">← Prev</button>
+            <span class="mx-2" id="tiPageInfo"></span>
+            <button class="btn btn-sm btn-outline-secondary" id="tiNext">Next →</button>
+            <button class="btn btn-sm btn-outline-primary ms-2" id="tiRefreshBtn">Tải lại</button>
+          </div>
+        </div>
+        <div class="card-body p-0">
+          <table class="table table-striped table-hover mb-0" id="tiTable">
+            <thead class="table-light"><tr><th>#</th><th>Type</th><th>Value</th><th style="width:120px">Thao tác</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- IDS -->
+    <div class="tab-pane fade" id="ids-pane">
+
+      <div class="row g-3">
+        <div class="col-lg-6">
+
+          <!-- IDS RULES -->
+          <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <span>Suricata local.rules (CRUD)</span>
+              <div>
+                <button class="btn btn-sm btn-outline-primary" id="idsRulesReload">Tải lại</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="alert alert-warning py-2">
+                File: <code class="mono">/etc/suricata/rules/local.rules</code>. Cần chạy Ryu bằng <code>sudo</code> hoặc gán quyền ghi cho user.
+              </div>
+
+              <form id="idsRuleForm" class="mb-3">
+                <label class="form-label">Thêm/Upsert Rule (raw Snort/Suricata)</label>
+                <textarea id="idsRawRule" class="form-control mono" rows="4" placeholder='alert tcp any any -> any 80 (msg:"BLOCK test"; sid:1000001; rev:1;)' ></textarea>
+                <div class="form-check mt-2">
+                  <input id="idsReplace" class="form-check-input" type="checkbox" checked>
+                  <label class="form-check-label">Replace theo SID nếu trùng</label>
+                </div>
+                <div class="form-check">
+                  <input id="idsReload" class="form-check-input" type="checkbox" checked>
+                  <label class="form-check-label">Reload Suricata sau khi ghi</label>
+                </div>
+                <button class="btn btn-success mt-2" type="submit">Ghi rule</button>
+              </form>
+
+              <div id="idsRulesError" class="text-danger small mb-2"></div>
+
+              <table class="table table-striped table-hover" id="idsRulesTable">
+                <thead class="table-light"><tr><th>#</th><th>SID</th><th>Message</th><th>Raw</th><th style="width:100px">Xoá</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+
+        </div>
+        <div class="col-lg-6">
+
+          <!-- IDS ALERTS -->
+          <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <span>EVE Alerts (normalized)</span>
+              <div class="d-flex align-items-center gap-2">
+                <select id="idsTypes" class="form-select form-select-sm" style="width:auto">
+                  <option value="alert,http,flow" selected>alert,http,flow</option>
+                  <option value="alert">alert</option>
+                  <option value="http">http</option>
+                  <option value="flow">flow</option>
+                </select>
+                <input id="idsLimit" type="number" class="form-control form-control-sm" style="width:90px" value="200" min="1" max="2000" />
+                <button class="btn btn-sm btn-outline-primary" id="idsAlertsReload">Tải</button>
+                <div class="form-check form-switch ms-2">
+                  <input class="form-check-input" type="checkbox" id="idsAuto" />
+                  <label class="form-check-label" for="idsAuto">Auto 3s</label>
+                </div>
+              </div>
+            </div>
+            <div class="card-body p-0">
+              <div id="idsAlertsError" class="text-danger small p-2"></div>
+              <table class="table table-striped table-hover mb-0 table-fixed" id="idsAlertsTable">
+                <thead class="table-light">
+                  <tr>
+                    <th style="width:160px">Time</th><th style="width:70px">Type</th>
+                    <th>Src</th><th>Dst</th><th style="width:80px">Proto</th>
+                    <th>Signature / HTTP</th><th style="width:80px">Sev</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+    </div><!-- /IDS tab -->
+
+  </div><!-- tab-content -->
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+
+// ===== RULES =====
+const api = {
+  list: ()=>fetch('/api/rules').then(r=>r.json()),
+  upsert:(p)=>fetch('/api/rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)}).then(r=>r.json()),
+  del:(rid)=>fetch('/api/rules/'+encodeURIComponent(rid),{method:'DELETE'}).then(r=>r.json()),
+};
+
+function renderRules(data){
+  const tb = $('#rulesTable tbody'); tb.innerHTML='';
+  (data.items||[]).forEach(rule=>{
+    const m = rule.match||{};
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="text-break">${rule.rule_id}</td>
+      <td>${rule.priority}</td>
+      <td>${rule.action}</td>
+      <td class="small">src=${m.ipv4_src||'*'}; dst=${m.ipv4_dst||'*'}; tcp_dst=${m.tcp_dst||'*'}</td>
+      <td>${rule.scope||'l3'}</td>
+      <td>
+        <button class="btn btn-sm btn-outline-secondary me-1" data-edit="${rule.rule_id}">Sửa</button>
+        <button class="btn btn-sm btn-outline-danger" data-del="${rule.rule_id}">Xoá</button>
+      </td>`;
+    tb.appendChild(tr);
+  });
+}
+async function loadRules(){ renderRules(await api.list()); }
+$('#refreshRules').addEventListener('click', loadRules);
+$('#fillSample').addEventListener('click', ()=>{
+  $('#rule_id').value='drop_tcp80_10-0-1-10_to_10-0-1-11';
+  $('#priority').value=1800; $('#action').value='drop'; $('#tcp_dst').value=80;
+  $('#ipv4_src').value='10.0.1.10'; $('#ipv4_dst').value='10.0.1.11'; $('#scope').value='l3';
+});
+$('#rulesTable').addEventListener('click', async (e)=>{
+  const t = e.target; if(!t.closest('button')) return;
+  const rid = t.getAttribute('data-edit')||t.getAttribute('data-del');
+  if(t.hasAttribute('data-edit')){
+    const data = await api.list(); const r = (data.items||[]).find(x=>x.rule_id===rid); if(!r) return;
+    $('#rule_id').value=r.rule_id; $('#priority').value=r.priority; $('#action').value=r.action;
+    $('#tcp_dst').value=r.match?.tcp_dst||''; $('#ipv4_src').value=r.match?.ipv4_src||''; $('#ipv4_dst').value=r.match?.ipv4_dst||''; $('#scope').value=r.scope||'l3';
+    window.scrollTo({top:0, behavior:'smooth'});
+  } else if(t.hasAttribute('data-del')){
+    if(confirm('Xoá rule '+rid+'?')){ await api.del(rid); loadRules(); }
+  }
+});
+$('#ruleForm').addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  const payload={
+    rule_id: $('#rule_id').value.trim(),
+    priority: parseInt($('#priority').value,10)||1800,
+    action: $('#action').value,
+    match: {
+      ipv4_src: $('#ipv4_src').value.trim()||undefined,
+      ipv4_dst: $('#ipv4_dst').value.trim()||undefined,
+      tcp_dst:  $('#tcp_dst').value?parseInt($('#tcp_dst').value,10):undefined,
+    },
+    scope: $('#scope').value
+  };
+  if(!payload.rule_id) return alert('Rule ID bắt buộc');
+  if(!payload.match.tcp_dst) return alert('TCP dst bắt buộc');
+  const res = await api.upsert(payload);
+  if(res.error) alert(res.error);
+  loadRules();
+});
+
+// ===== TI =====
+const tiApi = {
+  list:(offset=0,limit=500)=>fetch(`/api/ti?offset=${offset}&limit=${limit}`).then(r=>r.json()),
+  add: (items)=>fetch('/api/ti',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items})}).then(r=>r.json()),
+  del: (items)=>fetch('/api/ti',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({items})}).then(r=>r.json()),
+};
+let tiOffset = 0, tiLimit = 500, tiTotal = 0;
+function renderTI(data){
+  tiTotal = data.total||0; tiOffset = data.offset||0; tiLimit = data.limit||500;
+  $('#tiPageInfo').textContent = `offset=${tiOffset} / total=${tiTotal}`;
+  const tb = $('#tiTable tbody'); tb.innerHTML='';
+  (data.items||[]).forEach((it, idx)=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${tiOffset + idx + 1}</td><td>${it.type||'cidr'}</td>
+      <td class="text-break">${it.value||''}</td>
+      <td><button class="btn btn-sm btn-outline-danger" data-ti-del="${it.value}">Xoá</button></td>`;
+    tb.appendChild(tr);
+  });
+}
+async function loadTI(){ renderTI(await tiApi.list(tiOffset, tiLimit)); }
+$('#tiRefreshBtn').addEventListener('click', loadTI);
+$('#tiPrev').addEventListener('click', async ()=>{ tiOffset = Math.max(0, tiOffset - tiLimit); await loadTI(); });
+$('#tiNext').addEventListener('click', async ()=>{ const next = tiOffset + tiLimit; if(next >= tiTotal) return; tiOffset = next; await loadTI(); });
+document.getElementById('tiTable').addEventListener('click', async (e)=>{
+  const t = e.target; if(!t.closest('button')) return;
+  if(t.hasAttribute('data-ti-del')){
+    const v = t.getAttribute('data-ti-del');
+    if(confirm('Xoá TI '+v+'?')){ const res = await tiApi.del([v]); if(res.error) alert(res.error); await loadTI(); }
+  }
+});
+$('#tiForm').addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  const v = $('#ti_input').value.trim(); if(!v) return alert('Nhập IP/CIDR');
+  const res = await tiApi.add([v]); if(res.error) alert(res.error);
+  $('#ti_input').value=''; tiOffset=0; await loadTI();
+});
+
+// ===== IDS RULES =====
+const idsApi = {
+  list: ()=>fetch('/api/ids/rules').then(r=>r.json()),
+  add:  (raw, replace_sid=true, reload=true)=>fetch('/api/ids/rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({raw, replace_sid, reload})}).then(r=>r.json()),
+  del:  (sid, reload=true)=>fetch(`/api/ids/rules/${sid}?reload=${reload?'true':'false'}`,{method:'DELETE'}).then(r=>r.json()),
+  alerts:(limit=200, types='alert,http,flow')=>fetch(`/api/ids/alerts?limit=${limit}&types=${encodeURIComponent(types)}`).then(r=>r.json()),
+};
+
+function renderIdsRules(data){
+  const err = $('#idsRulesError'); err.textContent = data.error ? (data.error + (data.details?(' — '+data.details):'')) : '';
+  const tb = $('#idsRulesTable tbody'); tb.innerHTML='';
+  (data.items||[]).forEach((it, i)=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${i+1}</td>
+      <td>${it.sid||''}</td>
+      <td class="truncate" title="${it.msg||''}">${it.msg||''}</td>
+      <td><code class="small">${(it.raw||'').replace(/</g,'&lt;')}</code></td>
+      <td>${it.sid?`<button class="btn btn-sm btn-outline-danger" data-del-sid="${it.sid}">Xoá</button>`:''}</td>`;
+    tb.appendChild(tr);
+  });
+}
+async function loadIdsRules(){ renderIdsRules(await idsApi.list()); }
+$('#idsRulesReload').addEventListener('click', loadIdsRules);
+
+$('#idsRulesTable').addEventListener('click', async (e)=>{
+  const t = e.target; if(!t.closest('button')) return;
+  if(t.hasAttribute('data-del-sid')){
+    const sid = t.getAttribute('data-del-sid');
+    if(confirm('Xoá rule SID='+sid+'?')){
+      const res = await idsApi.del(sid, true);
+      if(res.error) alert(res.error);
+      await loadIdsRules();
+    }
+  }
+});
+$('#idsRuleForm').addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  const raw = $('#idsRawRule').value.trim();
+  if(!raw) return alert('Nhập rule');
+  const replace = $('#idsReplace').checked;
+  const reload  = $('#idsReload').checked;
+  const res = await idsApi.add(raw, replace, reload);
+  if(res.error) alert(res.error);
+  $('#idsRawRule').value='';
+  await loadIdsRules();
+});
+
+// ===== IDS ALERTS =====
+let idsAutoTimer=null;
+function renderAlerts(data){
+  const err = $('#idsAlertsError'); err.textContent = data.error ? (data.error + (data.details?(' — '+data.details):'')) : '';
+  const tb = $('#idsAlertsTable tbody'); tb.innerHTML='';
+  (data.items||[]).forEach(ev=>{
+    const src = [ev.src_ip, ev.src_port].filter(Boolean).join(':');
+    const dst = [ev.dst_ip, ev.dst_port].filter(Boolean).join(':');
+    const sig = ev.signature ? `${ev.signature} (sid:${ev.sid||''})` :
+                (ev.http_method||'') + ' ' + (ev.http_url||'') + (ev.http_host?(' @'+ev.http_host):'');
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="small">${ev.ts||''}</td>
+      <td>${(ev.type||'').toUpperCase()}</td>
+      <td class="truncate" title="${src}">${src}</td>
+      <td class="truncate" title="${dst}">${dst}</td>
+      <td>${ev.proto||''}</td>
+      <td class="truncate" title="${sig}">${sig||''}</td>
+      <td>${ev.severity??''}</td>`;
+    tb.appendChild(tr);
+  });
+}
+async function loadAlerts(){
+  const types = $('#idsTypes').value;
+  const lim   = parseInt($('#idsLimit').value||'200',10);
+  const data = await idsApi.alerts(lim, types);
+  renderAlerts(data);
+}
+$('#idsAlertsReload').addEventListener('click', loadAlerts);
+$('#idsAuto').addEventListener('change', (e)=>{
+  if(e.target.checked){
+    idsAutoTimer = setInterval(loadAlerts, 3000);
+  } else {
+    if(idsAutoTimer) clearInterval(idsAutoTimer), idsAutoTimer=null;
+  }
+});
+
+// init tab behaviors
+function boot(){
+  loadRules();
+  document.querySelector('button[data-bs-target="#ti-pane"]').addEventListener('shown.bs.tab', loadTI);
+  document.querySelector('button[data-bs-target="#ids-pane"]').addEventListener('shown.bs.tab', ()=>{
+    loadIdsRules(); loadAlerts();
+  });
+}
+boot();
+</script>
+</body>
+</html>
