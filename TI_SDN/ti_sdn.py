@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ryu TI Table20 – CHỈ áp TI trên sL3 (ổn định, tái chọn động nếu chọn nhầm ban đầu)
+ti_force_sL3_table1.py
+----------------------------------
+Ryu TI – CHỈ áp TI trên sL3 (Table 1), có tuỳ chọn ép nạp ngay vào sL3.
 
-Mục tiêu:
-- Mặc định thông tất cả host (NORMAL) trên mọi switch.
-- Chỉ switch L3 (sL3) mới nhận rule TI ở Table 20 (DROP theo ipv4_src/dst ∈ blacklist).
-- Tránh áp nhầm s1/s2: cơ chế chấm điểm + tái đánh giá động khi có thêm dữ liệu.
-
-Cách nhận diện sL3 (ưu tiên giảm dần):
-1) Tên port bắt đầu bằng 'sL3-' (FORCE_L3_BRIDGE_NAME '-') → chắc kèo nhất cho topo của bạn.
-2) Port name chứa '-vlan' (có internal VLAN).
-3) Bậc topo (--observe-links): số láng giềng switch lớn nhất (>=2).
-4) Fallback 'nhiều port nhất' — chỉ sau GRACE_PICK_S để tránh pick sớm nhầm.
-
-An toàn cấu hình:
-- Xóa flow cũ theo COOKIE_TI trước khi áp role mới (tránh trùng/nhảy bảng).
-- Lưu role đã áp để không reconfigure thừa.
-- Trong lúc chờ nhận diện, table 0 đặt NORMAL để mạng thông suốt.
+Tính năng chính:
+- Pipeline tối giản:
+    * L2 (không phải sL3): Table 0 -> NORMAL
+    * sL3: Table 0 -> GOTO 1; Table 1: DROP theo ipv4_src/dst ∈ blacklist, default NORMAL
+- ÉP CHỌN sL3 qua ENV:
+    * FORCE_L3_DPID=3 (ưu tiên theo DPID)
+    * FORCE_L3_NAME=sL3 (match prefix tên port, ví dụ sL3-vlan101, sL3-eth1)
+- Debounce re-apply (gom sự kiện PortDesc/Topology), cài flow theo delta (không spam)
+- Cookie tách bạch: BASE vs TI
+- Tải TI từ các nguồn công khai định kỳ, lưu/persist vào file JSONL
 
 Chạy:
-    ryu-manager --observe-links ti_sdn2_final.py
+    FORCE_L3_DPID=3 ryu-manager --observe-links ti_sdn.py
+hoặc:
+    FORCE_L3_NAME=sL3 ryu-manager --observe-links ti_sdn.py
 """
 
 import ipaddress
@@ -38,28 +37,48 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.topology import event as topo_event
 
 # ===================== CẤU HÌNH =====================
+# Giữ ý định sử dụng TABLE 1 cho TI
 TABLE_TI: int = 1
 PRIO_TI_DROP: int = 35000
 PRIO_TI_DEFAULT: int = 0
-COOKIE_TI: int = 0xAA11
+
+# Cookie tách bạch
+COOKIE_TI:   int = 0xAA11   # Chỉ cho TI (table 1)
+COOKIE_BASE: int = 0xAA10   # Baseline (table 0 NORMAL/GOTO)
+
+# Debounce re-apply
+REAPPLY_DEBOUNCE_S: float = 0.5
+
+# Lưu/persist TI
 LOCAL_STATE_FILE: str = "/tmp/ti_blacklist.jsonl"
-FETCH_INTERVAL_S: int = 300
-REQUEST_TIMEOUT_S: int = 15
-ACCEPT_MIN_PREFIX: int = 24
-MAX_NEW_PER_CYCLE: int = 500
 
-# Nhận diện sL3
-FORCE_L3_BRIDGE_NAME = "sL3"          # nếu port bắt đầu bằng "sL3-" → cộng điểm cực mạnh
-BRIDGE_NAME_HINT     = FORCE_L3_BRIDGE_NAME + "-"
-VLAN_NAME_HINT       = "-vlan"        # port có internal VLAN
-GRACE_PICK_S         = 5.0            # chỉ fallback sau khoảng thời gian này (tránh pick sớm)
-
+# Nguồn TI (có thể thay đổi)
 TI_SOURCES: List[str] = [
     "https://lists.blocklist.de/lists/all.txt",
     "https://iplists.firehol.org/files/firehol_level1.netset",
 ]
 
-TIEntry = Tuple[str, str]    # (addr_str, mask_str)
+FETCH_INTERVAL_S: int = 300
+REQUEST_TIMEOUT_S: int = 15
+ACCEPT_MIN_PREFIX: int = 24      # /24 trở lên
+MAX_NEW_PER_CYCLE: int = 10000     # giới hạn cài mới mỗi chu kỳ
+
+# FORCE chọn sL3
+FORCE_L3_DPID: Optional[int] = None   # Ưu tiên nếu set
+FORCE_L3_NAME: Optional[str] = "sL3"  # Prefix tên port
+
+# Đọc ENV (nếu có)
+try:
+    v = os.getenv("FORCE_L3_DPID")
+    if v:
+        FORCE_L3_DPID = int(v, 0)  # hỗ trợ "3" hoặc "0x3"
+    n = os.getenv("FORCE_L3_NAME")
+    if n:
+        FORCE_L3_NAME = n
+except Exception:
+    pass
+
+TIEntry = Tuple[str, str]  # (addr_str, netmask_str)
 
 
 class TITableRyu(app_manager.RyuApp):
@@ -69,23 +88,29 @@ class TITableRyu(app_manager.RyuApp):
         super().__init__(*args, **kwargs)
         self.lock = threading.RLock()
 
+        # TI state
         self.blacklist: Set[TIEntry] = set()
         self.pending: Set[TIEntry] = set()
+        self.installed_ti: Dict[int, Set[TIEntry]] = {}  # dpid -> entries đã cài theo delta
 
+        # Datapaths & topo
         self.datapaths: Dict[int, object] = {}          # dpid -> dp
         self.dp_ports: Dict[int, List[str]] = {}        # dpid -> [port names]
         self.neighbors: Dict[int, Set[int]] = {}        # dpid -> set(dpid neighbors)
-        self.l3_dpid: Optional[int] = None              # dpid L3 đã chọn
+        self.l3_dpid: Optional[int] = None              # DPID sL3
         self.applied_role: Dict[int, str] = {}          # dpid -> 'L3' | 'L2'
-        self.start_ts = time.time()
 
+        # Debounce timer
+        self._debounce_timer: Optional[threading.Timer] = None
+
+        # Tải local state (persist)
         self._load_local_state()
 
-        # Thread nền cập nhật TI
+        # Thread tải TI nền
         t = threading.Thread(target=self._ti_fetch_loop, daemon=True)
         t.start()
 
-    # ===================== OpenFlow helpers =====================
+    # ===================== Helpers: Flow ops =====================
     def _add_flow(self, dp, table_id: int, priority: int, match, actions=None, inst=None,
                   hard_timeout: int = 0, idle_timeout: int = 0, cookie: int = COOKIE_TI):
         ofp, p = dp.ofproto, dp.ofproto_parser
@@ -118,187 +143,192 @@ class TITableRyu(app_manager.RyuApp):
                                match=match)
         dp.send_msg(mod)
 
-    def _ensure_table0_goto_ti(self, dp) -> None:
-        p = dp.ofproto_parser
-        inst = [p.OFPInstructionGotoTable(TABLE_TI)]
-        self._add_flow(dp, 0, 0, p.OFPMatch(), inst=inst, cookie=COOKIE_TI)
-        self.logger.info(f"[TI] dp {dp.id}: table 0 default -> GOTO {TABLE_TI}")
-
+    # ===================== Helpers: Baseline & TI tables =====================
     def _ensure_table0_normal(self, dp) -> None:
         ofp, p = dp.ofproto, dp.ofproto_parser
         actions = [p.OFPActionOutput(ofp.OFPP_NORMAL)]
-        self._add_flow(dp, 0, 0, p.OFPMatch(), actions=actions, cookie=COOKIE_TI)
-        self.logger.info(f"[TI] dp {dp.id}: table 0 default -> NORMAL")
+        self._add_flow(dp, 0, 0, p.OFPMatch(), actions=actions, cookie=COOKIE_BASE)
+        self.logger.info(f"[BASE] dp 0x{dp.id:x}: T0 -> NORMAL")
 
-    def _ensure_table20_default_normal(self, dp) -> None:
+    def _ensure_table0_goto_ti(self, dp) -> None:
+        p = dp.ofproto_parser
+        inst = [p.OFPInstructionGotoTable(TABLE_TI)]
+        self._add_flow(dp, 0, 0, p.OFPMatch(), inst=inst, cookie=COOKIE_BASE)
+        self.logger.info(f"[BASE] dp 0x{dp.id:x}: T0 -> GOTO {TABLE_TI}")
+
+    def _ensure_ti_default_normal(self, dp) -> None:
         ofp, p = dp.ofproto, dp.ofproto_parser
         actions = [p.OFPActionOutput(ofp.OFPP_NORMAL)]
         self._add_flow(dp, TABLE_TI, PRIO_TI_DEFAULT, p.OFPMatch(), actions=actions, cookie=COOKIE_TI)
-        self.logger.info(f"[TI] dp {dp.id}: table {TABLE_TI} default -> NORMAL")
+        self.logger.info(f"[TI]   dp 0x{dp.id:x}: T{TABLE_TI} default -> NORMAL")
 
+    # ===================== Helpers: TI entries (delta install) =====================
     def _install_drop_entry(self, dp, entry: TIEntry) -> None:
         addr, mask = entry
         p = dp.ofproto_parser
         m_src = p.OFPMatch(eth_type=0x0800, ipv4_src=(addr, mask))
-        self._add_flow(dp, TABLE_TI, PRIO_TI_DROP, m_src, actions=[], cookie=COOKIE_TI)
         m_dst = p.OFPMatch(eth_type=0x0800, ipv4_dst=(addr, mask))
+        self._add_flow(dp, TABLE_TI, PRIO_TI_DROP, m_src, actions=[], cookie=COOKIE_TI)
         self._add_flow(dp, TABLE_TI, PRIO_TI_DROP, m_dst, actions=[], cookie=COOKIE_TI)
 
-    def _apply_entries_to_dp(self, dp, entries: List[TIEntry]) -> None:
-        for e in entries:
-            self._install_drop_entry(dp, e)
+    def _apply_entries_delta(self, dp, want: Set[TIEntry]):
+        current = self.installed_ti.setdefault(dp.id, set())
+        add_set = want - current
+        if add_set:
+            for e in sorted(add_set):
+                self._install_drop_entry(dp, e)
+            current |= add_set
+            self.logger.info(f"[TI]   dp 0x{dp.id:x}: +{len(add_set)} entries (total {len(current)})")
 
-    def _apply_entries_to_l3(self, entries: List[TIEntry]) -> None:
-        if self.l3_dpid is None:
-            return
-        dp = self.datapaths.get(self.l3_dpid)
-        if not dp:
-            return
-        self._apply_entries_to_dp(dp, entries)
+    def _apply_ti_on_l3(self, dp):
+        # Baseline trên sL3: GOTO table 1
+        self._ensure_table0_goto_ti(dp)
+        # Default NORMAL ở table 1
+        self._ensure_ti_default_normal(dp)
+        # Gom entries (blacklist ∪ pending) rồi cài theo delta
+        want = set(self.blacklist) | set(self.pending)
+        if self.pending:
+            for e in self.pending:
+                if e not in self.blacklist:
+                    self.blacklist.add(e)
+                    self._append_local_state(e)
+            self.pending.clear()
+        self._apply_entries_delta(dp, want)
 
-    # ===================== Scoring & re-selection =====================
+    # ===================== FORCE pick sL3 =====================
+    def _force_pick_l3_if_match(self, dp) -> bool:
+        # Ưu tiên theo DPID
+        if FORCE_L3_DPID is not None and dp.id == FORCE_L3_DPID:
+            self.l3_dpid = dp.id
+            self.logger.warning(f"[TI] FORCE L3 by DPID -> 0x{dp.id:x}")
+            self._apply_role_for_all_dp()
+            return True
+
+        # Hoặc theo prefix tên port (cần PortDesc đã đến)
+        if FORCE_L3_NAME:
+            names = self.dp_ports.get(dp.id, [])
+            has_prefix = any((n or "").startswith(FORCE_L3_NAME) for n in names)
+            if has_prefix and self.l3_dpid is None:
+                self.l3_dpid = dp.id
+                self.logger.warning(f"[TI] FORCE L3 by NAME -> 0x{dp.id:x} ({FORCE_L3_NAME})")
+                self._apply_role_for_all_dp()
+                return True
+        return False
+
+    # ===================== Debounce scheduler =====================
+    def _schedule_recompute(self):
+        if self._debounce_timer and self._debounce_timer.is_alive():
+            self._debounce_timer.cancel()
+        self._debounce_timer = threading.Timer(REAPPLY_DEBOUNCE_S, self._recompute_roles_once)
+        self._debounce_timer.start()
+
+    def _recompute_roles_once(self):
+        with self.lock:
+            # Khi đã FORCE, bỏ auto-reselect để không giật
+            if FORCE_L3_DPID is None and not FORCE_L3_NAME:
+                self._reconsider_l3()
+            self._apply_role_for_all_dp()
+
+    # ===================== L3 selection (auto – dùng khi không FORCE) =====================
     def _l3_score(self, dpid: int) -> int:
-        """
-        Tính điểm cho mỗi switch để chọn sL3. Điểm cao hơn => ưu tiên hơn.
-        """
         names = self.dp_ports.get(dpid, [])
         deg   = len(self.neighbors.get(dpid, set()))
         ports = len([n for n in names if n])
-
         score = 0
-        # Ưu tiên cực mạnh: port bắt đầu bằng "sL3-"
-        if any((n or "").startswith(BRIDGE_NAME_HINT) for n in names):
+        # hint: port prefix 'sL3-'
+        if any((n or "").startswith("sL3-") for n in names):
             score += 10000
-        # Ưu tiên mạnh: có internal vlan
-        if any(VLAN_NAME_HINT in (n or "").lower() for n in names):
+        # hint: '-vlan' (cổng nội bộ)
+        if any("-vlan" in (n or "").lower() for n in names):
             score += 5000
-        # Ưu tiên topo: độ bậc cao (thường sL3 nối >=2 switch)
         score += 100 * deg
-        # Tie-break: nhiều port hơn thì + điểm nhẹ
         score += ports
         return score
 
     def _pick_best_l3(self) -> Optional[int]:
-        """
-        Trả về dpid có điểm cao nhất. Trước GRACE_PICK_S sẽ tránh fallback kiểu
-        'nhiều port nhất' nếu chưa có tín hiệu vlan/topo/bridge name.
-        """
         if not self.datapaths:
             return None
-
-        scored = []
-        for dpid in self.datapaths.keys():
-            scored.append((self._l3_score(dpid), dpid))
+        scored = [(self._l3_score(d), d) for d in self.datapaths.keys()]
         if not scored:
             return None
         scored.sort(reverse=True)
-        best_score, best_dpid = scored[0]
-
-        # Nếu chưa qua GRACE mà best chỉ hơn nhờ ports (không có hint/topo), thì… đợi thêm
-        now = time.time()
-        if now - self.start_ts < GRACE_PICK_S:
-            names = self.dp_ports.get(best_dpid, [])
-            has_bridge = any((n or "").startswith(BRIDGE_NAME_HINT) for n in names)
-            has_vlan   = any(VLAN_NAME_HINT in (n or "").lower() for n in names)
-            deg        = len(self.neighbors.get(best_dpid, set()))
-            if not (has_bridge or has_vlan or deg >= 2):
-                return None
-
-        return best_dpid
+        return scored[0][1]
 
     def _reconsider_l3(self) -> None:
-        """
-        Gọi mỗi khi có dữ liệu mới (PortDesc/LinkAdd/LinkDel). Nếu best khác hiện tại,
-        di chuyển role: gỡ TI khỏi dp cũ, áp vào dp mới.
-        """
         best = self._pick_best_l3()
         if best is None:
             return
-
-        # Nếu chưa có L3 hiện tại -> áp luôn
         if self.l3_dpid is None:
             self.l3_dpid = best
             self.logger.info(f"[TI] Select L3 dpid=0x{best:x}")
-            self._apply_role_for_all_dp()
             return
-
-        # Nếu đã chọn mà best đổi -> migrate
         if best != self.l3_dpid:
             old = self.l3_dpid
             self.l3_dpid = best
-            self.logger.warning(f"[TI] Re-select L3: 0x{old:x} -> 0x{best:x}")
-            old_dp = self.datapaths.get(old)
-            new_dp = self.datapaths.get(best)
-            if old_dp:
-                self._del_flows_by_cookie(old_dp, None, COOKIE_TI)
-                self.applied_role.pop(old, None)
-                self._apply_role_for_dp(old_dp)   # sẽ đặt NORMAL (L2)
-            if new_dp:
-                self._del_flows_by_cookie(new_dp, None, COOKIE_TI)
-                self.applied_role.pop(best, None)
-                self._apply_role_for_dp(new_dp)   # sẽ đặt GOTO20 + TI (L3)
+            self._migrate_l3(old, best)
 
-    # ===================== Apply roles =====================
+    def _migrate_l3(self, old_dpid: int, new_dpid: int):
+        old_dp = self.datapaths.get(old_dpid)
+        new_dp = self.datapaths.get(new_dpid)
+        self.logger.warning(f"[TI] Re-select L3: 0x{old_dpid:x} -> 0x{new_dpid:x}")
+
+        # 1) Gỡ TI ở old L3, giữ baseline NORMAL
+        if old_dp:
+            self._del_flows_by_cookie(old_dp, None, COOKIE_TI)
+            self.installed_ti[old_dp.id] = set()
+            self._ensure_table0_normal(old_dp)
+            self.applied_role[old_dp.id] = 'L2'
+            self.logger.info(f"[TI]   Clear TI on old L3 0x{old_dpid:x}")
+
+        # 2) Áp TI ở new L3
+        if new_dp:
+            self._apply_ti_on_l3(new_dp)
+            self.applied_role[new_dp.id] = 'L3'
+            self.logger.info(f"[TI]   Applied TI on new L3 0x{new_dpid:x}")
+
+    # ===================== Apply roles idempotent =====================
     def _apply_role_for_dp(self, dp) -> None:
         if self.l3_dpid is None:
             return
-        want_role = 'L3' if dp.id == self.l3_dpid else 'L2'
-        cur_role = self.applied_role.get(dp.id)
-        if cur_role == want_role:
+        want = 'L3' if dp.id == self.l3_dpid else 'L2'
+        cur  = self.applied_role.get(dp.id)
+        if cur == want:
             return
 
-        # Xóa sạch flow TI trước khi set lại
+        # luôn dọn TI trước khi đổi vai
         self._del_flows_by_cookie(dp, None, COOKIE_TI)
+        self.installed_ti[dp.id] = set()
 
-        if want_role == 'L3':
-            # L3: Table0->TI, Table20 default NORMAL, cài entries
-            self._ensure_table0_goto_ti(dp)
-            self._ensure_table20_default_normal(dp)
-            if self.blacklist:
-                self._apply_entries_to_dp(dp, sorted(self.blacklist))
-            if self.pending:
-                for e in sorted(self.pending):
-                    self._install_drop_entry(dp, e)
-                    if e not in self.blacklist:
-                        self.blacklist.add(e)
-                        self._append_local_state(e)
-                self.pending.clear()
-            self.logger.info(f"[TI] Applied TI on L3 dp=0x{dp.id:x}")
+        if want == 'L3':
+            self._apply_ti_on_l3(dp)
         else:
-            # L2: Table0 -> NORMAL
             self._ensure_table0_normal(dp)
-            self.logger.info(f"[TI] Set NORMAL on L2 dp=0x{dp.id:x} (no TI)")
 
-        self.applied_role[dp.id] = want_role
+        self.applied_role[dp.id] = want
 
     def _apply_role_for_all_dp(self) -> None:
         for dp in list(self.datapaths.values()):
             self._apply_role_for_dp(dp)
 
-    # ===================== OF Handlers =====================
+    # ===================== OpenFlow Handlers =====================
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def on_switch_features(self, ev):
         dp = ev.msg.datapath
         self.datapaths[dp.id] = dp
 
-        # Tạm NORMAL để thông trong lúc chờ nhận diện
+        # baseline tạm NORMAL cho tất cả dp
         self._ensure_table0_normal(dp)
 
-        # Yêu cầu PortDesc để thu tên port
+        # yêu cầu PortDesc để lấy tên port
         req = dp.ofproto_parser.OFPPortDescStatsRequest(dp, 0)
         dp.send_msg(req)
 
-        # Sau 5s, refresh PortDesc một lần (để chắc đã thấy sL3-vlan*)
-        def _refresh_portdesc():
-            try:
-                req2 = dp.ofproto_parser.OFPPortDescStatsRequest(dp, 0)
-                dp.send_msg(req2)
-            except Exception:
-                pass
-        threading.Timer(5.0, _refresh_portdesc).start()
+        # FORCE ngay nếu khớp DPID (không cần đợi PortDesc)
+        if self._force_pick_l3_if_match(dp):
+            return
 
-        # Thử tái chọn sau một nhịp ngắn
-        threading.Timer(0.2, lambda: self._reconsider_l3()).start()
+        # debounce recompute
+        self._schedule_recompute()
 
     @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
     def on_port_desc(self, ev):
@@ -310,12 +340,14 @@ class TITableRyu(app_manager.RyuApp):
             except Exception:
                 nm = str(getattr(p, 'port_no', 'unknown'))
             names.append(nm)
+
         with self.lock:
             self.dp_ports[dp.id] = names
-            self._reconsider_l3()
-            self._apply_role_for_all_dp()
+            # FORCE lần nữa sau khi đã có tên port
+            if self.l3_dpid is None and self._force_pick_l3_if_match(dp):
+                return
+            self._schedule_recompute()
 
-    # Topology events (cần ryu-manager --observe-links)
     @set_ev_cls(topo_event.EventLinkAdd)
     def _on_link_add(self, ev):
         src = ev.link.src.dpid
@@ -323,8 +355,7 @@ class TITableRyu(app_manager.RyuApp):
         self.neighbors.setdefault(src, set()).add(dst)
         self.neighbors.setdefault(dst, set()).add(src)
         with self.lock:
-            self._reconsider_l3()
-            self._apply_role_for_all_dp()
+            self._schedule_recompute()
 
     @set_ev_cls(topo_event.EventLinkDelete)
     def _on_link_del(self, ev):
@@ -335,8 +366,7 @@ class TITableRyu(app_manager.RyuApp):
         if dst in self.neighbors:
             self.neighbors[dst].discard(src)
         with self.lock:
-            self._reconsider_l3()
-            self._apply_role_for_all_dp()
+            self._schedule_recompute()
 
     # ===================== TI background fetch =====================
     def _ti_fetch_loop(self):
@@ -350,11 +380,15 @@ class TITableRyu(app_manager.RyuApp):
                             delta = delta[:MAX_NEW_PER_CYCLE]
                         if delta:
                             self.logger.info(f"[TI] New entries: {len(delta)}")
+                            # Nếu đã có sL3, áp ngay theo delta; chưa có thì cho pending
                             if self.l3_dpid and self.l3_dpid in self.datapaths:
-                                self._apply_entries_to_l3(delta)
+                                dp = self.datapaths[self.l3_dpid]
+                                # thêm vào blacklist + persist trước
                                 for e in delta:
                                     self.blacklist.add(e)
                                     self._append_local_state(e)
+                                # cài delta
+                                self._apply_entries_delta(dp, set(delta))
                             else:
                                 for e in delta:
                                     self.pending.add(e)
@@ -416,9 +450,10 @@ class TITableRyu(app_manager.RyuApp):
                         obj = json.loads(line)
                         cidr = obj.get('cidr')
                         if not cidr:
-                            ip_legacy = obj.get('ip')
+                            ip_legacy = obj.get('ip') or obj.get('addr')
+                            mask_legacy = obj.get('mask') or "255.255.255.255"
                             if ip_legacy:
-                                self.blacklist.add((str(ip_legacy), "255.255.255.255"))
+                                self.blacklist.add((str(ip_legacy), str(mask_legacy)))
                                 cnt += 1
                             continue
                         net = ipaddress.ip_network(cidr, strict=False)
@@ -443,4 +478,3 @@ class TITableRyu(app_manager.RyuApp):
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception as e:
             self.logger.error(f"[TI] write state error: {e}")
-
